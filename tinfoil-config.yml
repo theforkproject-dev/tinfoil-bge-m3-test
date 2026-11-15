@@ -16,7 +16,7 @@ networks:
     allow: [bge-h200-test-20261115.as186v.workers.dev]
 containers:
   - name: embedder
-    image: ghcr.io/huggingface/text-embeddings-inference@sha256:2e49c87518f247b7a40530728532b24a352800bb7a501d431a8c22dcb289c681
+    image: ghcr.io/theforkproject-dev/bge-m3-tei-runtime@sha256:18cf06d32dbe9bff7dd922671747b56a565d49779161f2b9fc67ee6510d3d141
     runtime: nvidia
     gpus: all
     models: [bge-m3]

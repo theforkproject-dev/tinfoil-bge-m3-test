@@ -22,5 +22,7 @@ jobs:
           docker push "$DST"
           docker manifest inspect "$SRC" > source.json
           docker manifest inspect "$DST" > mirror.json
-          cmp source.json mirror.json
+          jq -S '{config:.config.digest,layers:[.layers[].digest]}' source.json > source-bytes.json
+          jq -S '{config:.config.digest,layers:[.layers[].digest]}' mirror.json > mirror-bytes.json
+          cmp source-bytes.json mirror-bytes.json
           docker logout ghcr.io

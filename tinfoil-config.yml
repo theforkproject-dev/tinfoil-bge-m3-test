@@ -1,0 +1,199 @@
+cvm-version: 0.14.17
+cpus: 8
+memory: 32768
+gpus: 1
+models:
+  - name: bge-m3
+    repo: BAAI/bge-m3@5617a9f61b028005a4858fdac845db406aefb181
+    mpk: "83599fc62a68b3baf55e1b911bb51f338598fa96907253e30c6731185345b313_4587327488_a8aed7e6-b140-5ff3-9020-7e7e844e7c6a"
+attested-keys:
+  - id: report-signing
+    key: ed25519
+networks:
+  backend: {}
+  reporting:
+    egress: allowlist
+    allow: [bge-h200-test-20261115.as186v.workers.dev]
+containers:
+  - name: embedder
+    image: ghcr.io/huggingface/text-embeddings-inference@sha256:2e49c87518f247b7a40530728532b24a352800bb7a501d431a8c22dcb289c681
+    runtime: nvidia
+    gpus: all
+    models: [bge-m3]
+    networks: [backend]
+    secrets: [BGE_TEST_API_KEY]
+    env:
+      - NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      - LD_LIBRARY_PATH: /usr/local/nvidia/lib64:/usr/local/cuda/lib64
+      - HF_HUB_OFFLINE: "1"
+      - HF_HUB_DISABLE_TELEMETRY: "1"
+      - HOME: /tmp
+    entrypoint: [/bin/sh, -c]
+    command:
+      - 'export API_KEY="$BGE_TEST_API_KEY"; exec text-embeddings-router --model-id /tinfoil/models/bge-m3 --served-model-name BAAI/bge-m3 --pooling cls --dtype float32 --auto-truncate=false --max-batch-tokens 16384 --max-client-batch-size 16 --max-concurrent-requests 32 --hostname 0.0.0.0 --port 8080 --uds-path /tmp/tei.sock --huggingface-hub-cache /tmp/hf --disable-spans'
+    tmpfs:
+      /tmp: size=2g,mode=1777,exec
+    healthcheck:
+      test: [CMD, curl, -sf, http://localhost:8080/health]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 5m
+  - name: test-client
+    image: python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+    runtime: nvidia
+    gpus: all
+    attestation: true
+    keys: [report-signing]
+    networks: [backend, reporting]
+    secrets: [BGE_TEST_API_KEY, BGE_TEST_REPORT_TOKEN]
+    env:
+      - NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      - PATH: /usr/local/nvidia/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      - LD_LIBRARY_PATH: /usr/local/nvidia/lib64
+      - PYTHONDONTWRITEBYTECODE: "1"
+    tmpfs:
+      /tmp: size=32m,mode=1777
+    command:
+      - python
+      - -u
+      - -c
+      - |
+          import base64, concurrent.futures, datetime, hashlib, http.client, json, math, os, pathlib, socket, statistics, subprocess, time, urllib.request, urllib.error
+          BASE = 'http://embedder:8080'
+          COLLECTOR = 'https://bge-h200-test-20261115.as186v.workers.dev'
+          PIN = '5617a9f61b028005a4858fdac845db406aefb181'
+          MODEL = 'BAAI/bge-m3'
+          class UnixHTTP(http.client.HTTPConnection):
+              def connect(self):
+                  self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                  self.sock.settimeout(self.timeout)
+                  self.sock.connect('/tinfoil/attestation.sock')
+          
+          def request(path, data=None, auth=True):
+              headers = {'Content-Type':'application/json'}
+              if auth: headers['Authorization']='Bearer '+os.environ['BGE_TEST_API_KEY']
+              start=time.perf_counter()
+              req=urllib.request.Request(BASE+path, data=None if data is None else json.dumps(data).encode(),headers=headers)
+              try:
+                  with urllib.request.urlopen(req,timeout=120) as r:
+                      raw=r.read(2_000_000); status=r.status
+              except urllib.error.HTTPError as e:
+                  status=e.code; raw=e.read(4000)
+              try: body=json.loads(raw)
+              except Exception: body={'text':raw.decode(errors='replace')[:2000]}
+              return status,body,time.perf_counter()-start
+          
+          def embed(texts, auth=True, model=MODEL, dimensions=1024):
+              return request('/v1/embeddings',{'model':model,'input':texts,'dimensions':dimensions,'encoding_format':'float'},auth)
+          
+          def check_vectors(body, n):
+              data=body['data']
+              assert len(data)==n and [d['index'] for d in data]==list(range(n))
+              vectors=[d['embedding'] for d in data]
+              assert all(len(v)==1024 and all(math.isfinite(x) for x in v) for v in vectors)
+              norms=[math.sqrt(sum(x*x for x in v)) for v in vectors]
+              assert all(abs(x-1)<1e-4 for x in norms),norms
+              return vectors,norms
+          
+          def cosine(a,b): return sum(x*y for x,y in zip(a,b))/(math.sqrt(sum(x*x for x in a))*math.sqrt(sum(y*y for y in b)))
+          
+          def run_tests(nonce):
+              out={'schema':'bge-h200-qualification-v1','nonce':nonce,'model':MODEL,'revision':PIN,'runtime':'TEI 1.9.4 Hopper','dtype':'float32','pooling':'cls','normalize':True,'query_instruction':None,'started_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'checks':{}}
+              for _ in range(120):
+                  try:
+                      status,info,_=request('/info')
+                      if status==200:
+                          status,_,_=request('/health')
+                          if status==200: break
+                  except Exception: pass
+                  time.sleep(5)
+              else: raise RuntimeError('embedding_server_not_ready')
+              out['server_info']=info
+              try:
+                  p=subprocess.run(['nvidia-smi','--query-gpu=name,uuid,memory.total,driver_version','--format=csv,noheader,nounits'],capture_output=True,text=True,timeout=15)
+                  out['gpu']={'returncode':p.returncode,'stdout':p.stdout[:4000],'stderr':p.stderr[:1000]}
+              except Exception as e: out['gpu']={'error':type(e).__name__}
+              status,_,_=embed(['synthetic authorization check'],False)
+              out['checks']['unauthorized_rejected']={'passed':status==401,'status':status}
+              texts=['The dog chased a ball across the garden.','A canine ran after a ball on the lawn.','Quarterly tax filings require accurate financial statements.']
+              status,body,elapsed=embed(texts)
+              assert status==200,{'embedding_status':status,'error':body}
+              vectors,norms=check_vectors(body,3)
+              out['checks']['openai_shape']={'passed':True,'dimensions':1024,'indices':[0,1,2],'norms':norms,'model_returned':body.get('model'),'usage':body.get('usage')}
+              similar=cosine(vectors[0],vectors[1]);unrelated=cosine(vectors[0],vectors[2])
+              out['checks']['synthetic_semantics']={'passed':similar>unrelated,'related_cosine':similar,'unrelated_cosine':unrelated}
+              out['reference_synthetic']={'texts':texts,'vectors':vectors}
+              status,body,_=embed([texts[2],texts[0],texts[0]])
+              assert status==200
+              reordered,_=check_vectors(body,3)
+              out['checks']['batch_order_repeatability']={'passed':cosine(reordered[0],vectors[2])>0.9999 and cosine(reordered[1],vectors[0])>0.9999 and cosine(reordered[1],reordered[2])>0.99999}
+              status,bad,_=embed(['test'],model='definitely-wrong-model')
+              out['checks']['wrong_model_rejected']={'passed':status>=400,'status':status,'body':bad}
+              status,bad,_=embed(['test'],dimensions=17)
+              out['checks']['wrong_dimensions_rejected']={'passed':status>=400,'status':status,'returned_dimensions':len(bad.get('data',[{}])[0].get('embedding',[])) if bad.get('data') else None}
+              timings=[]
+              for _ in range(12):
+                  status,b,_elapsed=embed(['A short synthetic query about storing knowledge.'])
+                  assert status==200;check_vectors(b,1);timings.append(_elapsed)
+              out['warm_query_latency_seconds']={'n':len(timings),'median':statistics.median(timings),'p95':sorted(timings)[math.ceil(len(timings)*0.95)-1],'samples':timings,'scope':'inside-enclave HTTP, not external application latency'}
+              longtext='hello '*8190
+              status,tokens,_=request('/tokenize',{'inputs':longtext,'add_special_tokens':True})
+              length=len(tokens[0]) if isinstance(tokens,list) and len(tokens)==1 and isinstance(tokens[0],list) else None
+              out['tokenize_status']=status
+              out['boundary_token_count']=length
+              status,b,sec=embed([longtext])
+              out['checks']['boundary_input']={'passed':status==200 and length==8192,'status':status,'tokens':length,'seconds':sec,'usage':b.get('usage')}
+              if status==200:check_vectors(b,1)
+              status,b,sec=embed(['hello '*9000])
+              out['checks']['oversized_rejected']={'passed':status>=400,'status':status,'error':b,'seconds':sec}
+              begin=time.perf_counter()
+              with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                  results=list(pool.map(lambda i:embed(['Synthetic batch request '+str(i)+' about knowledge retrieval.']),range(16)))
+              out['concurrency_four']={'requests':16,'seconds':time.perf_counter()-begin,'statuses':[x[0] for x in results]}
+              out['checks']['concurrent_requests']={'passed':all(x[0]==200 for x in results)}
+              out['completed_at']=datetime.datetime.now(datetime.timezone.utc).isoformat()
+              out['all_checks_passed']=all(c['passed'] for c in out['checks'].values())
+              return out
+          
+          def main():
+              report_token=os.environ['BGE_TEST_REPORT_TOKEN']
+              req=urllib.request.Request(COLLECTOR+'/challenge',headers={'Authorization':'Bearer '+report_token})
+              with urllib.request.urlopen(req,timeout=30) as r: challenge=json.load(r)
+              nonce=challenge['nonce']
+              try: payload=run_tests(nonce)
+              except Exception as e: payload={'schema':'bge-h200-qualification-v1','nonce':nonce,'fatal_error':str(e)[:2500],'all_checks_passed':False,'at':datetime.datetime.now(datetime.timezone.utc).isoformat()}
+              raw=json.dumps(payload,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
+              pathlib.Path('/tmp/result.json').write_bytes(raw)
+              priv='/run/tinfoil/keys/report-signing/private_key.pem'
+              pub='/run/tinfoil/keys/report-signing/public_key.pem'
+              subprocess.run(['openssl','pkeyutl','-sign','-rawin','-inkey',priv,'-in','/tmp/result.json','-out','/tmp/result.sig'],check=True,capture_output=True)
+              proof=None
+              for _ in range(24):
+                  try:
+                      client=UnixHTTP('localhost',timeout=30)
+                      client.request('GET','/.well-known/tinfoil-attestation?nonce='+nonce)
+                      r=client.getresponse();data=r.read(1_500_000);client.close()
+                      if r.status==200: proof=json.loads(data);break
+                  except Exception:pass
+                  time.sleep(5)
+              if proof is None: raise RuntimeError('attestation_unavailable')
+              report={'nonce':nonce,'payload_b64':base64.b64encode(raw).decode(),'signature_b64':base64.b64encode(pathlib.Path('/tmp/result.sig').read_bytes()).decode(),'public_key_pem':pathlib.Path(pub).read_text(),'attestation':proof}
+              body=json.dumps(report,separators=(',',':')).encode()
+              for attempt in range(6):
+                  try:
+                      req=urllib.request.Request(COLLECTOR+'/report',data=body,headers={'Authorization':'Bearer '+report_token,'Content-Type':'application/json'})
+                      with urllib.request.urlopen(req,timeout=30) as r:
+                          assert r.status==200
+                      print('synthetic_report_delivered',flush=True)
+                      break
+                  except Exception:
+                      if attempt==5:raise
+                      time.sleep(5)
+              time.sleep(600)
+          if __name__=='__main__':main()
+shim:
+  upstream-container: embedder
+  upstream-port: 8080
+  paths:
+    - /health

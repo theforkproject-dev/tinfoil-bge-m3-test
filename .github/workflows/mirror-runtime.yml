@@ -1,0 +1,26 @@
+name: Mirror pinned public TEI runtime
+on:
+  workflow_dispatch:
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Pull exact public source and publish unchanged bytes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_USER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          SRC=ghcr.io/huggingface/text-embeddings-inference@sha256:2e49c87518f247b7a40530728532b24a352800bb7a501d431a8c22dcb289c681
+          DST=ghcr.io/theforkproject-dev/bge-m3-tei-runtime:hopper-1.9.4
+          docker pull "$SRC"
+          docker tag "$SRC" "$DST"
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GH_USER" --password-stdin
+          docker push "$DST"
+          docker manifest inspect "$SRC" > source.json
+          docker manifest inspect "$DST" > mirror.json
+          cmp source.json mirror.json
+          docker logout ghcr.io
